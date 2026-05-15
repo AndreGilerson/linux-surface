@@ -37,6 +37,13 @@ HAL_INSTALL_PREFIX="/usr"
 DRIVERS_REPO="https://github.com/intel/ipu7-drivers.git"
 BINS_REPO="https://github.com/intel/ipu7-camera-bins.git"
 HAL_REPO="https://github.com/intel/ipu7-camera-hal.git"
+# Pin to the commit whose static-graph autogen hash (3011642587) matches the
+# IMX681/OV13858 graph-settings binaries baked into ipu7-camera-hal.patch.
+# Newer HAL revisions (afe14ea0 and later) regenerated the autogen with a
+# different hash, which makes StaticGraphReader::Init reject the binaries
+# with "failed to init graph reader". Re-pin when the surface binaries are
+# regenerated against a newer template.
+HAL_COMMIT="f46f3335431ab02a5c4ac253052ad89d178a2ea2"
 ICAMERASRC_REPO="https://github.com/intel/icamerasrc.git"
 ICAMERASRC_BRANCH="icamerasrc_slim_api"
 
@@ -475,13 +482,21 @@ do_install() {
        ! pkg-config --exists libva-drm 2>/dev/null; then
         missing_pkgs+=("libva-dev" "libgstreamer-plugins-bad1.0-dev")
     fi
+    # libexpat headers — pulled in via MediaControl.h in the HAL build
+    if ! pkg-config --exists expat 2>/dev/null && [ ! -f /usr/include/expat.h ]; then
+        missing_pkgs+=("libexpat1-dev")
+    fi
+    # jsoncpp headers — pulled in via JsonParserBase.h in the HAL build
+    if ! pkg-config --exists jsoncpp 2>/dev/null && [ ! -f /usr/include/jsoncpp/json/json.h ]; then
+        missing_pkgs+=("libjsoncpp-dev")
+    fi
 
     if [ ${#missing_pkgs[@]} -gt 0 ]; then
         error "Missing build dependencies: ${missing_pkgs[*]}"
         error "Install them first, e.g.:"
         error "  sudo apt install build-essential cmake autoconf automake libtool pkg-config \\"
         error "    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \\"
-        error "    libgstreamer-plugins-bad1.0-dev libva-dev git"
+        error "    libgstreamer-plugins-bad1.0-dev libva-dev libexpat1-dev libjsoncpp-dev git"
         exit 1
     fi
 
@@ -532,6 +547,68 @@ do_install() {
             warn "Build may fail if your kernel is missing required IPU7 patches."
         fi
 
+        # ABI compatibility shim with in-kernel staging intel_ipu7
+        # ----------------------------------------------------------
+        # On kernels >= 6.17 the OOT Makefile builds only the psys/ subdir and
+        # expects the in-staging intel_ipu7 / intel_ipu7_isys modules to provide
+        # the rest. But the OOT ipu7.h carries an extra `struct dentry *ipu7_dir;`
+        # field (under CONFIG_DEBUG_FS) that the staging header does not. When
+        # CONFIG_DEBUG_FS=y in the running kernel that single field shifts every
+        # subsequent member of struct ipu7_device — including the
+        # `ipu7_bus_ready_to_probe` flag the OOT psys probe gates on — so the
+        # OOT psys reads junk and stays in -EPROBE_DEFER forever.
+        # Drop the offending block from the OOT ipu7.h so the struct layout the
+        # OOT psys is compiled against matches what the staging intel_ipu7 actually
+        # allocates. Idempotent: a second run is a no-op once the lines are gone.
+        local ipu7_h="$BUILD_DIR/ipu7-drivers/drivers/media/pci/intel/ipu7/ipu7.h"
+        if [ -f "$ipu7_h" ] && grep -q 'struct dentry \*ipu7_dir;' "$ipu7_h"; then
+            info "Stripping CONFIG_DEBUG_FS ipu7_dir field for staging-ABI compat..."
+            patch -d "$BUILD_DIR/ipu7-drivers/drivers/media/pci/intel/ipu7" -p1 <<'IPU7_H_ABI_PATCH'
+--- a/ipu7.h
++++ b/ipu7.h
+@@ -81,9 +81,6 @@ struct ipu7_device {
+
+ 	void __iomem *base;
+ 	void __iomem *pb_base;
+-#ifdef CONFIG_DEBUG_FS
+-	struct dentry *ipu7_dir;
+-#endif
+ 	u8 hw_ver;
+ 	bool ipc_reinit;
+ 	bool secure_mode;
+IPU7_H_ABI_PATCH
+            # Stub out the two psys.c references to the removed ipu7_dir field:
+            # the in-staging intel_ipu7 owns no debugfs root, so we create the
+            # "psys" subdir under the debugfs root (NULL parent) and drop the
+            # null-check around teardown (debugfsdir is always set on the path
+            # that allocated it).
+            patch -d "$BUILD_DIR/ipu7-drivers/drivers/media/pci/intel/ipu7" -p1 <<'IPU7_PSYS_ABI_PATCH'
+--- a/psys/ipu-psys.c
++++ b/psys/ipu-psys.c
+@@ -1310,7 +1310,7 @@
+ 	struct dentry *file;
+ 	struct dentry *dir;
+
+-	dir = debugfs_create_dir("psys", psys->adev->isp->ipu7_dir);
++	dir = debugfs_create_dir("psys", NULL);
+ 	if (IS_ERR(dir))
+ 		return -ENOMEM;
+
+@@ -1457,10 +1457,7 @@
+ 	struct ipu7_psys *psys = dev_get_drvdata(&auxdev->dev);
+ 	struct device *dev = &auxdev->dev;
+ #ifdef CONFIG_DEBUG_FS
+-	struct ipu7_device *isp = psys->adev->isp;
+-
+-	if (isp->ipu7_dir)
+-		debugfs_remove_recursive(psys->debugfsdir);
++	debugfs_remove_recursive(psys->debugfsdir);
+ #endif
+
+ 	mutex_lock(&ipu7_psys_mutex);
+IPU7_PSYS_ABI_PATCH
+        fi
+
         info "Building IPU7 kernel modules..."
         cd "$BUILD_DIR/ipu7-drivers"
         make -j"$(nproc)" KERNELRELEASE="$(uname -r)" || {
@@ -541,12 +618,16 @@ do_install() {
             cd "$BUILD_DIR"
         }
 
-        if [ -f "$BUILD_DIR/ipu7-drivers/drivers/media/pci/intel/ipu7/intel-ipu7.ko" ] || \
-           [ -f "$BUILD_DIR/ipu7-drivers/drivers/media/pci/intel/ipu7/intel-ipu7-psys.ko" ]; then
+        # Build output paths vary across ipu7-drivers versions: PSys is in a
+        # psys/ subdir on current trees, top-level on older ones. Walk the
+        # build dir to detect any module the out-of-tree build produced.
+        if find "$BUILD_DIR/ipu7-drivers" -name 'intel-ipu7*.ko' -print -quit | grep -q .; then
             info "Installing kernel modules..."
             make modules_install KERNELRELEASE="$(uname -r)"
             depmod -a "$(uname -r)" || warn "depmod failed (non-fatal)"
             info "IPU7 kernel modules installed. A reboot is needed to load them."
+        else
+            warn "No intel-ipu7*.ko produced; skipping modules_install."
         fi
     else
         info "Skipping IPU7 kernel module build."
@@ -590,12 +671,15 @@ do_install() {
 
     if confirm_step "Build and install the camera HAL?"; then
         if [ ! -d "$BUILD_DIR/ipu7-camera-hal" ]; then
-            info "Cloning ipu7-camera-hal..."
-            git clone --depth=1 "$HAL_REPO" "$BUILD_DIR/ipu7-camera-hal"
+            info "Cloning ipu7-camera-hal (pinned to $HAL_COMMIT)..."
+            git clone "$HAL_REPO" "$BUILD_DIR/ipu7-camera-hal"
+            git -C "$BUILD_DIR/ipu7-camera-hal" checkout "$HAL_COMMIT"
         fi
 
         info "Applying Surface Pro 11 patches..."
         cd "$BUILD_DIR/ipu7-camera-hal"
+        # Make sure we're on the pinned commit even if the dir was reused.
+        git checkout "$HAL_COMMIT" 2>/dev/null || true
         # Reset to clean upstream state (removes tracked changes AND untracked files
         # from a previous patch attempt — needed because the patch adds new files)
         git checkout -- . 2>/dev/null || true
@@ -609,12 +693,18 @@ do_install() {
 
         info "Building camera HAL..."
         mkdir -p build && cd build
-        cmake -DCMAKE_BUILD_TYPE=Release \
+        # Upstream still pins cmake_minimum_required(VERSION 2.8); CMake 4.x dropped
+        # compatibility for <3.5, so we have to opt into the legacy policy version.
+        # IPU_VERSIONS is set per-commit: the pinned f46f3335 HAL only ships
+        # ipu_desc/{ipu7x,ipu75xa} (no ipu8 subdir yet). SP11 only needs ipu7x
+        # anyway; ipu75xa is built so the same install works on Panther/Arrow Lake.
+        cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+              -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX="$HAL_INSTALL_PREFIX" \
               -DCMAKE_INSTALL_LIBDIR=lib \
               -DBUILD_CAMHAL_ADAPTOR=ON \
               -DBUILD_CAMHAL_PLUGIN=ON \
-              -DIPU_VERSIONS="ipu7x;ipu75xa;ipu8" \
+              -DIPU_VERSIONS="ipu7x;ipu75xa" \
               -DUSE_STATIC_GRAPH=ON \
               -DUSE_STATIC_GRAPH_AUTOGEN=ON ..
         make -j"$(nproc)"
@@ -646,6 +736,44 @@ do_install() {
     else
         info "Skipping GStreamer plugin build."
     fi
+
+    # --- udev rules (always installed) ---
+    # Grants /dev/ipu7-psys* + /dev/v4l-subdev*/video* access to the `video`
+    # group so the camera HAL works without root, hides the raw ISYS capture
+    # nodes from desktop apps, and tags the v4l2loopback nodes for portal/snap
+    # access. Done unconditionally because the psys access rule is required
+    # for the camera HAL regardless of whether the user enables v4l2loopback.
+    info ""
+    info "Installing camera udev rules..."
+    cp "$SCRIPT_DIR/91-v4l2loopback-surface.rules" /etc/udev/rules.d/91-v4l2loopback-surface.rules
+    udevadm control --reload-rules 2>/dev/null || true
+    # Re-trigger existing nodes so the new perms apply right away. Use --action=add
+    # (not change) because MODE/OWNER actions in udev rules only consistently apply
+    # under add-event semantics — change events reliably reapply TAGS in CURRENT_TAGS
+    # but not file-system attributes.
+    udevadm trigger --action=add \
+        --subsystem-match=video4linux \
+        --subsystem-match=misc 2>/dev/null || true
+
+    # Belt-and-suspenders: explicitly scrub stale ACL grants + ownership/mode bits
+    # from the raw IPU7 ISYS capture nodes. The udev rule alone is enough on a
+    # fresh boot, but on a live system the ISYS nodes were created before our rule
+    # existed and logind already granted the seat-user uaccess ACL — the trigger
+    # cleans the udev DB's CURRENT_TAGS but doesn't undo the file-system ACL. This
+    # makes a re-run idempotent and avoids requiring a reboot.
+    if command -v setfacl &>/dev/null; then
+        for dev in /sys/class/video4linux/video*; do
+            [ -d "$dev" ] || continue
+            name=$(cat "$dev/name" 2>/dev/null || true)
+            if [[ "$name" == "Intel IPU7 ISYS Capture"* ]]; then
+                devnode="/dev/$(basename "$dev")"
+                setfacl -b "$devnode" 2>/dev/null || true
+                chown root:root "$devnode" 2>/dev/null || true
+                chmod 0600 "$devnode" 2>/dev/null || true
+            fi
+        done
+    fi
+    info "Installed /etc/udev/rules.d/91-v4l2loopback-surface.rules"
 
     # --- Step 5: v4l2loopback virtual cameras ---
     info ""
@@ -697,6 +825,14 @@ do_install() {
             install -m 755 "$SCRIPT_DIR/surface-camera-bridge.sh" /usr/local/bin/surface-camera-bridge.sh
             info "Installed /usr/local/bin/surface-camera-bridge.sh"
 
+            # Grant helper: adds a per-user `setfacl -m u:USER:rw` entry on each
+            # ISYS capture node so the bridge (running as USER) can open them.
+            # Note: after this runs `ls -la` will show `crw-rw----+ root root` on
+            # /dev/video0..31 — the `+` indicates an ACL, and ls displays the ACL
+            # *mask* in the group column. The underlying mode is still 0600; only
+            # USER and root have access. `getfacl /dev/video0` is the correct way
+            # to inspect actual access. Other-user processes (including snap-
+            # confined Firefox) still cannot open the device.
             install -m 755 "$SCRIPT_DIR/surface-camera-isys-grant.sh" /usr/local/bin/surface-camera-isys-grant.sh
             info "Installed /usr/local/bin/surface-camera-isys-grant.sh"
 
@@ -706,10 +842,6 @@ do_install() {
             mkdir -p /etc/systemd/user
             cp "$SCRIPT_DIR/surface-camera-bridge@.service" /etc/systemd/user/surface-camera-bridge@.service
             info "Installed systemd user service template"
-
-            cp "$SCRIPT_DIR/91-v4l2loopback-surface.rules" /etc/udev/rules.d/91-v4l2loopback-surface.rules
-            udevadm control --reload-rules 2>/dev/null || true
-            info "Installed /etc/udev/rules.d/91-v4l2loopback-surface.rules"
 
             # Load the module now (unload first if already loaded with different params)
             if lsmod | grep -q v4l2loopback; then
@@ -792,10 +924,30 @@ do_install() {
     info ""
     info "=== Step 6/7: AIQD calibration persistence ==="
 
-    if [ ! -f /etc/tmpfiles.d/camera-hal.conf ]; then
-        echo 'd /run/camera 0755 root root -' > /etc/tmpfiles.d/camera-hal.conf
+    # /run/camera holds the per-sensor .aiqd ISP-calibration caches that the HAL
+    # writes back on pipeline teardown. Make it group-writable by `video` so the
+    # HAL can persist its cache when run as a non-root desktop user.
+    #
+    # /dev/ipu7-psys0 is a non-classed character device (no `subsystem` symlink
+    # in sysfs), and on systemd v259+ udev MODE/GROUP rules don't reliably
+    # apply to those at boot — `udevadm test` says the rule applies, but the
+    # live device keeps its kernel-default 0600 root:root. The `z` line below
+    # is run by systemd-tmpfiles after the device is created and sets the perms
+    # deterministically. /dev/ipu-psys0 path covers the older driver naming.
+    local tmpfiles_content='d /run/camera 0775 root video -
+z /dev/ipu7-psys0 0660 root video -
+z /dev/ipu-psys0  0660 root video -'
+    if [ ! -f /etc/tmpfiles.d/camera-hal.conf ] || \
+       [ "$(cat /etc/tmpfiles.d/camera-hal.conf 2>/dev/null)" != "$tmpfiles_content" ]; then
+        printf '%s\n' "$tmpfiles_content" > /etc/tmpfiles.d/camera-hal.conf
+        # Re-apply against an existing /run/camera too — --create on its own
+        # leaves the existing dir's mode/owner untouched.
+        rm -rf /run/camera 2>/dev/null || true
         systemd-tmpfiles --create 2>/dev/null || true
-        info "AIQD persistence configured (/run/camera/)."
+        # `z` lines (adjust perms on existing nodes) need an explicit re-run
+        # against the file to fix devices that already exist.
+        systemd-tmpfiles /etc/tmpfiles.d/camera-hal.conf 2>/dev/null || true
+        info "AIQD persistence + psys perms configured (/run/camera writable, /dev/ipu7-psys0 → video:0660)."
     else
         info "Already configured."
     fi
@@ -868,6 +1020,17 @@ do_install() {
         fi
     fi
 
+    # --- Group membership ---
+    # /dev/ipu7-psys0 and /dev/video* are owned by the video group; the camera
+    # HAL needs both. Make sure the invoking user is in that group, otherwise
+    # the gst pipelines work under sudo but not as the desktop user.
+    local target_user="${SUDO_USER:-}"
+    if [ -n "$target_user" ] && ! id -nG "$target_user" | tr ' ' '\n' | grep -qx video; then
+        info "Adding $target_user to the 'video' group (needed for ipu7-psys/v4l devices)..."
+        usermod -aG video "$target_user" || warn "usermod failed; add manually: sudo usermod -aG video $target_user"
+        warn "$target_user must log out and back in (or reboot) for the new group to take effect."
+    fi
+
     # --- Done ---
     echo ""
     info "============================================"
@@ -926,6 +1089,12 @@ do_dry_run() {
        ! pkg-config --exists libva 2>/dev/null || \
        ! pkg-config --exists libva-drm 2>/dev/null; then
         missing_pkgs+=("libva-dev" "libgstreamer-plugins-bad1.0-dev")
+    fi
+    if ! pkg-config --exists expat 2>/dev/null && [ ! -f /usr/include/expat.h ]; then
+        missing_pkgs+=("libexpat1-dev")
+    fi
+    if ! pkg-config --exists jsoncpp 2>/dev/null && [ ! -f /usr/include/jsoncpp/json/json.h ]; then
+        missing_pkgs+=("libjsoncpp-dev")
     fi
     if [ ${#missing_pkgs[@]} -gt 0 ]; then
         warn "Missing build dependencies: ${missing_pkgs[*]}"

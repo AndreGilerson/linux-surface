@@ -53,7 +53,7 @@ the front and rear cameras.
    # Debian/Ubuntu
    sudo apt install build-essential cmake autoconf automake libtool pkg-config git \
      libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-     libgstreamer-plugins-bad1.0-dev libva-dev \
+     libgstreamer-plugins-bad1.0-dev libva-dev libexpat1-dev libjsoncpp-dev \
      msitools  # for AIQB extraction from Microsoft firmware
    ```
 
