@@ -19,6 +19,10 @@ SPEAKER_CONF="surface-pro-11-speaker-eq.conf"
 MIC_CONF="surface-pro-11-mic-denoise.conf"
 UCM_DIR="/usr/share/alsa/ucm2/sof-soundwire"
 UCM_DMIC_CONF="rt1320-dmic.conf"
+UCM_CONFD_DIR="/usr/share/alsa/ucm2/conf.d"
+UCM_ALIAS_DIR="$UCM_CONFD_DIR/sofsoundwire"
+UCM_ALIAS_LINK="$UCM_ALIAS_DIR/sofsoundwire.conf"
+UCM_ALIAS_TARGET="../../sof-soundwire/sof-soundwire.conf"
 SOUNDWIRE_CARD=""
 
 info()  { echo -e "\033[0;32m[INFO]\033[0m $*"; }
@@ -82,6 +86,17 @@ if [[ "${1:-}" == "--dry-run" ]]; then
         warn "  UCM install would be skipped."
     fi
 
+    dry "=== ALSA UCM conf.d alias (sofsoundwire) ==="
+    if [[ -d "$UCM_CONFD_DIR" && -d "$UCM_CONFD_DIR/sof-soundwire" ]]; then
+        if [[ -L "$UCM_ALIAS_LINK" || -f "$UCM_ALIAS_LINK" ]]; then
+            dry "  Already present: $UCM_ALIAS_LINK (would skip)"
+        else
+            dry "  Would create: $UCM_ALIAS_LINK -> $UCM_ALIAS_TARGET"
+        fi
+    else
+        warn "  conf.d/sof-soundwire not found; alias would be skipped."
+    fi
+
     # PipeWire configs
     echo ""
     dry "=== PipeWire filter-chain configs ==="
@@ -119,6 +134,14 @@ if [[ "${1:-}" == "--remove" || "${1:-}" == "--uninstall" ]]; then
     if [[ -f "$UCM_DIR/$UCM_DMIC_CONF" ]]; then
         warn "UCM config $UCM_DIR/$UCM_DMIC_CONF left in place (needed for mic to work)."
         warn "Remove manually only if you no longer need the internal microphone."
+    fi
+    # Remove the sofsoundwire UCM alias only if it's the symlink we created
+    if [[ -L "$UCM_ALIAS_LINK" && "$(readlink "$UCM_ALIAS_LINK")" == "$UCM_ALIAS_TARGET" ]]; then
+        rm -f "$UCM_ALIAS_LINK"
+        rmdir --ignore-fail-on-non-empty "$UCM_ALIAS_DIR" 2>/dev/null || true
+        info "Removed UCM alias: $UCM_ALIAS_LINK"
+    elif [[ -e "$UCM_ALIAS_LINK" ]]; then
+        warn "UCM alias $UCM_ALIAS_LINK present but not ours — left in place."
     fi
     info "Removed PipeWire configs. Restart filter-chain to take effect:"
     echo "  systemctl --user restart filter-chain"
@@ -358,6 +381,27 @@ else
     warn "UCM directory not found: $UCM_DIR"
     warn "Skipping UCM install. The internal microphone may not appear until"
     warn "alsa-ucm-conf is installed and this file is placed manually."
+fi
+
+# --- Install UCM conf.d alias for the dashless card.id ---
+# The SOF SoundWire card on Lunar Lake reports card.id "sofsoundwire" (ALSA
+# strips the dash from "sof-soundwire"). UCM matches profiles by card.id via
+# conf.d/<card-id>/, but upstream alsa-ucm-conf only ships conf.d/sof-soundwire/.
+# Without an alias for the dashless name, WirePlumber can't find a UCM profile
+# and won't expose the HiFi sink/source, so PipeWire shows no internal speaker
+# even though aplay -l sees the card.
+if [[ -d "$UCM_CONFD_DIR" && -d "$UCM_CONFD_DIR/sof-soundwire" ]]; then
+    if [[ -L "$UCM_ALIAS_LINK" || -f "$UCM_ALIAS_LINK" ]]; then
+        info "UCM alias already present: $UCM_ALIAS_LINK (skipping)"
+    else
+        mkdir -p "$UCM_ALIAS_DIR"
+        ln -sf "$UCM_ALIAS_TARGET" "$UCM_ALIAS_LINK"
+        info "Installed UCM alias: $UCM_ALIAS_LINK -> $UCM_ALIAS_TARGET"
+        info "  (fixes the 'sofsoundwire' card.id vs 'sof-soundwire' UCM dir mismatch)"
+    fi
+else
+    warn "UCM conf.d/sof-soundwire not found; cannot install UCM alias."
+    warn "Update alsa-ucm-conf, or the internal speaker may not appear in PipeWire."
 fi
 
 # --- Detect SoundWire card number ---

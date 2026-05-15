@@ -24,20 +24,29 @@ appear as a capture device.
 
 ### SOF topology
 
-The kernel patch sets `sof_tplg_filename = "sof-lnl-rt1320-l0.tplg"` for the
-Surface Pro 11 machine entry, but the monolithic topology file is not needed.
-The `get_function_tplg_files` callback in the patch causes the driver to load
-existing SDCA split topologies instead:
+The kernel patch sets `sof_tplg_filename = "sof-sdca-1amp-id2.tplg"` for the
+Surface Pro 11 machine entry. The actual topology used at runtime is the pair
+of SDCA split topologies loaded via the `get_function_tplg_files` callback:
 
 ```
-sof-audio-pci-intel-lnl: Using function topologies instead intel/sof-ipc4-tplg/sof-lnl-rt1320-l0.tplg
+sof-audio-pci-intel-lnl: Using function topologies instead intel/sof-ipc4-tplg/sof-sdca-1amp-id2.tplg
 sof-audio-pci-intel-lnl: loading topology 0: intel/sof-ipc4-tplg/sof-sdca-1amp-id2.tplg
 sof-audio-pci-intel-lnl: loading topology 1: intel/sof-ipc4-tplg/sof-sdca-mic-id4.tplg
 ```
 
-The monolithic file name only serves as a fallback and does not exist in any
-released sof-bin or firmware-sof-signed package (checked up to sof-bin
-v2025.12.2). No symlink is needed.
+The `sof_tplg_filename` value is a struct field that the SOF probe path
+existence-checks before the function-topology callback ever runs (see
+`sound/soc/sof/fw-file-profile.c::sof_test_topology_file`). It must point at
+a file that actually ships in firmware-sof-signed / sof-bin —
+`sof-sdca-1amp-id2.tplg` is the natural choice because it is also one of the
+two function topologies loaded at runtime, so it doubles as a sensible
+fallback if `get_function_tplg_files` ever returns 0.
+
+Earlier revisions of this driver used a descriptive monolithic filename
+(`sof-lnl-rt1320-l0.tplg`) and relied on the existence check being lenient.
+That worked on v6.17 but fails on v6.18+, where the strict existence check
+makes the SOF probe error out with `sof_probe_work failed err: -2` before
+the function topologies ever get a chance to load.
 
 ### Mixer switches
 
@@ -57,18 +66,6 @@ amixer -c <N> cset name='rt1320-1 FU Capture Switch' on,on,on,on
 The install script automatically enables these and persists them with
 `alsactl store`. UCM profiles should also handle this, but the explicit
 initialization ensures audio works even on the very first boot.
-
-### First boot note
-
-On the very first boot after applying the kernel patch, the SOF probe may fail
-with `sof_probe_work failed err: -2` and no sound card is created. This is a
-one-time issue. Either reboot or reload the module:
-
-```bash
-sudo modprobe -r snd-sof-pci-intel-lnl && sudo modprobe snd-sof-pci-intel-lnl
-```
-
-All subsequent reboots work normally.
 
 ### Speaker EQ
 
@@ -185,38 +182,57 @@ names (find them with `wpctl status`).
 
 ## Technical notes
 
-### Why `sof_tplg_filename` is set to a non-existent file
+### Why `sof_tplg_filename` is `sof-sdca-1amp-id2.tplg`
 
-The kernel patch sets `sof_tplg_filename = "sof-lnl-rt1320-l0.tplg"` in the
-machine table entry even though this file does not exist in any released sof-bin
-or firmware-sof-signed package (checked up to sof-bin v2025.12.2). This is
-intentional and follows upstream convention.
+The kernel patch sets `sof_tplg_filename = "sof-sdca-1amp-id2.tplg"` in the
+machine table entry. This is a real file shipped in firmware-sof-signed /
+sof-bin and is also one of the two function topologies loaded at runtime.
 
 `sof_tplg_filename` is a **required struct field** — it is dereferenced
 unconditionally in several places in the SOF core (`pcm.c`, `hda.c`,
-`fw-file-profile.c`) and cannot be NULL. However, when `get_function_tplg_files`
-is also set (as it is in our entry), the function topologies take priority:
+`fw-file-profile.c`). On v6.18+ the probe path also *existence-checks* it
+before the `get_function_tplg_files` callback runs:
 
 ```
-topology.c:
+sof_init_environment()
+  └── sof_test_topology_file()    // firmware_request_nowarn() → -ENOENT if missing
+                                  // probe aborts before topology load
+```
+
+So the value must be a file that actually exists on disk. The function
+topology callback still takes priority during the real load:
+
+```
+topology.c::snd_sof_load_topology()
   if (get_function_tplg_files returns > 0)
-      → load per-function topologies (sof-sdca-1amp-id2.tplg, sof-sdca-mic-id4.tplg)
+      → load per-function topologies (sof-sdca-1amp-id2.tplg + sof-sdca-mic-id4.tplg)
   else
-      → fall back to sof_tplg_filename (monolithic, single file)
+      → fall back to sof_tplg_filename (single file)
 ```
 
-The monolithic filename is only used as a fallback if function topology loading
-fails (returns 0). In practice, the function topologies always succeed because
-`sof-sdca-1amp-id2.tplg` and `sof-sdca-mic-id4.tplg` ship in all current
-firmware packages. No symlink or dummy file is needed.
+Using `sof-sdca-1amp-id2.tplg` as the field value gives us both:
+the existence check passes, and if the callback ever returns 0 the fallback
+still loads a working amp topology (just without the mic).
 
-All other upstream entries that use `get_function_tplg_files` follow the same
-pattern — they specify a descriptive monolithic name that may not exist as an
-actual file:
-- `sof-lnl-cs42l43-l0.tplg` (cs42l43 entry)
-- `sof-lnl-rt722-l0.tplg` (rt722 entry)
-- `sof-lnl-rt712-l2-rt1320-l1.tplg` (rt712-vb + rt1320 entry)
+Earlier revisions of this patch used a descriptive monolithic name
+(`sof-lnl-rt1320-l0.tplg`) the way other upstream entries do, e.g.
+`sof-lnl-cs42l43-l0.tplg`, `sof-lnl-rt722-l0.tplg`, etc. Those names rely on
+historical loose-existence behaviour and only work for codec configurations
+where the SOF project actually ships a matching tplg file. For SP11's
+RT1320-on-link-0 configuration no such file ships, so we use the function
+topology name directly.
 
-The monolithic name cannot be replaced with a function topology name (e.g.,
-`sof-sdca-1amp-id2.tplg`) because it is a single string field — the fallback
-would then load only the amp topology without the mic.
+### Why the `sofsoundwire` UCM alias is created
+
+The SOF SoundWire machine driver names its card `sof-soundwire`, but ALSA
+strips non-alphanumeric characters from `card.id`, so the actual id exposed
+in `/proc/asound/cardN/id` is `sofsoundwire` (no dash). UCM matches profiles
+by `card.id` via `conf.d/<card-id>/`, and upstream alsa-ucm-conf only ships
+`conf.d/sof-soundwire/`. Without a `conf.d/sofsoundwire/` alias, WirePlumber
+can't find a UCM profile and the internal speaker/mic don't appear in
+PipeWire — even though `aplay -l` sees the card.
+
+The install script creates `conf.d/sofsoundwire/sofsoundwire.conf` as a
+symlink back to the upstream `sof-soundwire.conf`. The right long-term fix
+is a PR against alsa-project/alsa-ucm-conf to add the alias upstream so it
+covers every Lunar Lake / Panther Lake SDW device, not just SP11.

@@ -3,9 +3,6 @@ From: =?UTF-8?q?Andr=C3=A9=20Gilerson?= <andre.gilerson@gmail.com>
 Date: Fri, 15 May 2026 16:09:26 +0200
 Subject: [PATCH] ASoC: SOF SDW: Add Surface Pro 11 (Intel Lunar Lake) audio
  support
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
 
 Enable speakers and microphone on the Microsoft Surface Pro 11 Business
 (Intel Lunar Lake) via SoundWire:
@@ -18,8 +15,6 @@ Enable speakers and microphone on the Microsoft Surface Pro 11 Business
 - Force "Playback-/Capture-SmartAmp" stream names for SDW amplifier
   dailinks so the topology binding matches the
   sof-lnl-rt1320-l0.tplg expectations.
-
-Signed-off-by: André Gilerson <andre.gilerson@gmail.com>
 ---
  sound/soc/intel/boards/sof_sdw.c              | 10 ++-
  .../intel/common/soc-acpi-intel-lnl-match.c   | 72 +++++++++++++++++++
@@ -57,7 +52,7 @@ index c013e31d098e..683658612ca2 100644
  			return -ENOMEM;
  
 diff --git a/sound/soc/intel/common/soc-acpi-intel-lnl-match.c b/sound/soc/intel/common/soc-acpi-intel-lnl-match.c
-index 937a74a5d523..de606463492a 100644
+index 937a74a5d523..908a9556eff6 100644
 --- a/sound/soc/intel/common/soc-acpi-intel-lnl-match.c
 +++ b/sound/soc/intel/common/soc-acpi-intel-lnl-match.c
 @@ -8,6 +8,7 @@
@@ -154,7 +149,7 @@ index 937a74a5d523..de606463492a 100644
 +		.link_mask = BIT(0),
 +		.links = lnl_sdw_rt1320_l0_amp_mic,
 +		.drv_name = "sof_sdw",
-+		.sof_tplg_filename = "sof-lnl-rt1320-l0.tplg",
++		.sof_tplg_filename = "sof-sdca-1amp-id2.tplg",
 +		.machine_check = surface_lnl_rt1320_check,
 +		.get_function_tplg_files = sof_sdw_get_tplg_files,
 +	},
